@@ -9,11 +9,14 @@ from ase import Atoms
 import ase.lattice.cubic
 import ase.spacegroup
 import ase.build
+from ase.visualize import view
 
 from matid import SymmetryAnalyzer
 from matid.symmetry.wyckoffset import WyckoffSet
 from matid.data.constants import WYCKOFF_LETTER_POSITIONS
 from matid.utils.segfault_protect import segfault_protect
+
+from conftest import create_graphene, create_si, create_mos2
 
 
 class dotdict(dict):
@@ -51,11 +54,7 @@ class SymmetryAnalyser3DTests(unittest.TestCase):
         """Test that a silicon diamond lattice is characterized correctly.
         """
         # Create the system
-        si = ase.lattice.cubic.Diamond(
-            size=(1, 1, 1),
-            symbol='Si',
-            pbc=(1, 1, 1),
-            latticeconstant=5.430710)
+        si = create_si()
 
         # Apply some noise
         si.rattle(stdev=0.05, seed=42)
@@ -87,6 +86,10 @@ class SymmetryAnalyser3DTests(unittest.TestCase):
         self.assertTrue(np.array_equal(data.prim_equiv, [0, 0]))
         self.assertFalse(data.has_free_wyckoff_parameters)
         self.assertWyckoffGroupsOk(data.conv_system, data.wyckoff_sets_conv)
+        pbc_conv = data.conv_system.get_pbc()
+        pbc_prim = data.prim_system.get_pbc()
+        self.assertTrue(np.array_equal(pbc_conv, [True, True, True]))
+        self.assertTrue(np.array_equal(pbc_prim, [True, True, True]))
 
     def test_fcc(self):
         """Test that a primitive NaCl fcc lattice is characterized correctly.
@@ -131,6 +134,10 @@ class SymmetryAnalyser3DTests(unittest.TestCase):
         self.assertTrue(np.array_equal(data.prim_wyckoff, ["a", "b"]))
         self.assertFalse(data.has_free_wyckoff_parameters)
         self.assertWyckoffGroupsOk(data.conv_system, data.wyckoff_sets_conv)
+        pbc_conv = data.conv_system.get_pbc()
+        pbc_prim = data.prim_system.get_pbc()
+        self.assertTrue(np.array_equal(pbc_conv, [True, True, True]))
+        self.assertTrue(np.array_equal(pbc_prim, [True, True, True]))
 
     def test_bcc(self):
         """Test that a body centered cubic lattice for copper is characterized
@@ -164,6 +171,10 @@ class SymmetryAnalyser3DTests(unittest.TestCase):
         self.assertTrue(np.array_equal(data.prim_wyckoff, ["a"]))
         self.assertFalse(data.has_free_wyckoff_parameters)
         self.assertWyckoffGroupsOk(data.conv_system, data.wyckoff_sets_conv)
+        pbc_conv = data.conv_system.get_pbc()
+        pbc_prim = data.prim_system.get_pbc()
+        self.assertTrue(np.array_equal(pbc_conv, [True, True, True]))
+        self.assertTrue(np.array_equal(pbc_prim, [True, True, True]))
 
     def test_unsymmetric(self):
         """Test that a random system is handled correctly.
@@ -189,6 +200,10 @@ class SymmetryAnalyser3DTests(unittest.TestCase):
         self.assertEqual(data.bravais_lattice, "aP")
         self.assertTrue(data.has_free_wyckoff_parameters)
         self.assertWyckoffGroupsOk(data.conv_system, data.wyckoff_sets_conv)
+        pbc_conv = data.conv_system.get_pbc()
+        pbc_prim = data.prim_system.get_pbc()
+        self.assertTrue(np.array_equal(pbc_conv, [True, True, True]))
+        self.assertTrue(np.array_equal(pbc_prim, [True, True, True]))
 
     def assertWyckoffGroupsOk(self, system, wyckoff_sets):
         """Check that the Wyckoff sets contain all atoms and are ordered
@@ -255,20 +270,7 @@ class SymmetryAnalyser2DTests(unittest.TestCase):
     """
     def test_graphene_primitive(self):
         # Original system in positions: C: d
-        system = Atoms(
-            symbols=["C", "C"],
-            cell=np.array((
-                [2.4595121467478055, 0.0, 0.0],
-                [-1.2297560733739028, 2.13, 0.0],
-                [0.0, 0.0, 20.0]
-            )),
-            scaled_positions=np.array((
-                [1/3, 2/3, 0.5],
-                [2/3, 1/3, 0.5]
-            )),
-            pbc=[True, True, False]
-        )
-
+        system = create_graphene()
         analyzer = SymmetryAnalyzer(system)
         wyckoff_letters_conv = analyzer.get_wyckoff_letters_conventional()
         wyckoff_letters_assumed = ["c", "c"]
@@ -379,45 +381,86 @@ class SymmetryAnalyser2DTests(unittest.TestCase):
         pbc = conv_system.get_pbc()
         self.assertTrue(np.array_equal(pbc, [True, True, False]))
 
+    def test_mos2(self):
+        """Tests a non-flat 2D system with vacuum.
+        """
+        system = create_mos2()
+        analyzer = SymmetryAnalyzer(system)
+        conv_system = analyzer.get_conventional_system()
+        prim_system = analyzer.get_primitive_system()
+        self.assertTrue(np.array_equal(conv_system.get_pbc(), [True, True, False]))
+        self.assertTrue(np.array_equal(prim_system.get_pbc(), [True, True, False]))
+
+        wyckoff_sets_conv = analyzer.get_wyckoff_sets_conventional()
+        for wset in wyckoff_sets_conv:
+            if wset.element == "Mo":
+                self.assertEqual(wset.wyckoff_letter, "a")
+            if wset.element == "S":
+                self.assertEqual(wset.wyckoff_letter, "h")
+
+    def test_mos2_vacuum(self):
+        """Tests a non-flat 2D system with vacuum.
+        """
+        system = ase.build.mx2(
+            formula="MoS2",
+            kind="2H",
+            a=3.18,
+            thickness=3.19,
+            size=(5, 5, 1),
+            vacuum=8
+        )
+
+        analyzer = SymmetryAnalyzer(system)
+        conv_system = analyzer.get_conventional_system()
+        prim_system = analyzer.get_primitive_system()
+        self.assertTrue(np.array_equal(conv_system.get_pbc(), [True, True, False]))
+        self.assertTrue(np.array_equal(prim_system.get_pbc(), [True, True, False]))
+
+        wyckoff_sets_conv = analyzer.get_wyckoff_sets_conventional()
+        for wset in wyckoff_sets_conv:
+            if wset.element == "Mo":
+                self.assertEqual(wset.wyckoff_letter, "a")
+            if wset.element == "S":
+                self.assertEqual(wset.wyckoff_letter, "h")
+
 
 class WyckoffTests(unittest.TestCase):
     """Tests for the Wyckoff information.
     """
-    # def test_default_11(self):
-        # """Disabled for now, as the test does not pass due to problems in
-        # spglib itself. See issue: https://github.com/spglib/spglib/issues/100
-        # """
-        # spg_11 = Atoms(
-            # symbols=["Cs", "Cs", "Cs", "Cs", "Hg", "Hg", "I", "I", "I", "I", "I", "I", "I", "I"],
-            # positions=np.array([
-                # [9.69146609791823e-10, 1.4864766792606409e-10, 2.1853577172462063e-10],
-                # [3.3905490010486266e-10, 4.918238896132229e-10, 2.21360430203356e-10],
-                # [-1.2127900679182296e-10, 5.914386740739359e-10, 6.432402437246207e-10],
-                # [5.088127028951374e-10, 2.4826245238677706e-10, 6.46064902203356e-10],
-                # [2.8716666854716376e-10, 6.364047202750034e-11, 2.173113402377552e-10],
-                # [5.607009344528362e-10, 6.764458699724996e-10, 6.420158122377551e-10],
-                # [6.774950241049414e-10, 5.508695960016385e-10, 2.0178558873663998e-11],
-                # [5.65784431911122e-10, 1.376848453015636e-10, 2.1575858671176543e-10],
-                # [-4.08306506008426e-11, 5.351034259842179e-10, 2.1998387806870958e-10],
-                # [6.805724578658182e-10, 5.50411253982781e-10, 4.175063512681291e-10],
-                # [1.7037257889505867e-10, 1.892167459983615e-10, 4.44883030873664e-10],
-                # [2.82083171088878e-10, 6.024014966984365e-10, 6.404630587117654e-10],
-                # [8.886982536008425e-10, 2.0498291601578212e-10, 6.446883500687096e-10],
-                # [1.6729514513418176e-10, 1.8967508801721902e-10, 8.42210823268129e-10]
-            # ])*1e10,
-            # cell=np.array([
-                # [1.132741769e-9, -1.0246116e-11, 0.0],
-                # [-2.84874166e-10,7.50332458e-10, 0.0],
-                # [0.0, 0.0, 8.49408944e-10]
-            # ])*1e10,
-            # pbc=True
-        # )
+    def test_default_11(self):
+        """See issue: https://github.com/spglib/spglib/issues/100
+        """
+        spg_11 = Atoms(
+            symbols=["Cs", "Cs", "Cs", "Cs", "Hg", "Hg", "I", "I", "I", "I", "I", "I", "I", "I"],
+            positions=np.array([
+                [9.69146609791823e-10, 1.4864766792606409e-10, 2.1853577172462063e-10],
+                [3.3905490010486266e-10, 4.918238896132229e-10, 2.21360430203356e-10],
+                [-1.2127900679182296e-10, 5.914386740739359e-10, 6.432402437246207e-10],
+                [5.088127028951374e-10, 2.4826245238677706e-10, 6.46064902203356e-10],
+                [2.8716666854716376e-10, 6.364047202750034e-11, 2.173113402377552e-10],
+                [5.607009344528362e-10, 6.764458699724996e-10, 6.420158122377551e-10],
+                [6.774950241049414e-10, 5.508695960016385e-10, 2.0178558873663998e-11],
+                [5.65784431911122e-10, 1.376848453015636e-10, 2.1575858671176543e-10],
+                [-4.08306506008426e-11, 5.351034259842179e-10, 2.1998387806870958e-10],
+                [6.805724578658182e-10, 5.50411253982781e-10, 4.175063512681291e-10],
+                [1.7037257889505867e-10, 1.892167459983615e-10, 4.44883030873664e-10],
+                [2.82083171088878e-10, 6.024014966984365e-10, 6.404630587117654e-10],
+                [8.886982536008425e-10, 2.0498291601578212e-10, 6.446883500687096e-10],
+                [1.6729514513418176e-10, 1.8967508801721902e-10, 8.42210823268129e-10]
+            ])*1e10,
+            cell=np.array([
+                [1.132741769e-9, -1.0246116e-11, 0.0],
+                [-2.84874166e-10,7.50332458e-10, 0.0],
+                [0.0, 0.0, 8.49408944e-10]
+            ])*1e10,
+            pbc=True
+        )
 
-        # # Find the Wyckoff groups
-        # analyzer = SymmetryAnalyzer(spg_11, symmetry_tol=0.1)
-        # spg = analyzer.get_space_group_number()
-        # self.assertEqual(spg, 11)
-        # wyckoff_sets = analyzer.get_wyckoff_sets_conventional(return_parameters=True)
+        # Find the Wyckoff groups
+        analyzer = SymmetryAnalyzer(spg_11, symmetry_tol=0.1)
+        spg = analyzer.get_space_group_number()
+        self.assertEqual(spg, 11)
+        wyckoff_sets = analyzer.get_wyckoff_sets_conventional(return_parameters=True)
 
     def test_default_87(self):
         """System where the equivalent_atoms reported by spglib do not match
@@ -427,7 +470,7 @@ class WyckoffTests(unittest.TestCase):
         spg_87 = Atoms(
             symbols=[28, 28, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 38, 38, 38, 38, 52, 52],
             scaled_positions=[
-                [0.00000000e+00, 0.00000000e+00, 0.00000000e+00],                                                                                    
+                [0.00000000e+00, 0.00000000e+00, 0.00000000e+00],
                 [5.00000783e-01, 5.00000105e-01, 5.00000504e-01],
                 [2.57675031e-01, 2.57675031e-01, 0.00000000e+00],
                 [7.42324606e-01, 7.42324606e-01, 0.00000000e+00],
@@ -869,9 +912,11 @@ class GroundStateTests(unittest.TestCase):
             self.assertTrue(np.array_equal(conv_pos[3], a1))
 
     def test_transformation_affine(self):
-        """Test a transform where the transformation is a proper rigid
-        transformation in the scaled cell basis, but will be non-rigid in the
-        cartesian basis. This kind of transformations should not be allowed.
+        """This spacegroup (47) has additional affine normalizers that should
+        not be taken into account when determining the conventional system.
+        There are only 8 different possible Euclidean normalizations, whereas
+        there are 48 normalizations if you take into account the affine ones as
+        well.
         """
         system = Atoms(
             cell=[
@@ -904,10 +949,10 @@ class GroundStateTests(unittest.TestCase):
 
     def test_zinc_blende(self):
         """Tests that all different forms of the zinc-blende structure can be
-        normalized to the same structure. The use of improper normalizers
-        from Bilbao is required to achieve this, but the resulting structure
-        must then have a rigid translation in cartesian coordinates to the
-        original system.
+        normalized to the same structure. In order to do this properly we need
+        to also include Euclidean normalizers where the transformation is not a
+        proper rigid rotations, but due to the symmetry of the structure result
+        in a valid transformation.
         """
         # Primitive
         zb_prim = ase.build.bulk("ZnS", crystalstructure="zincblende", a=5.42)

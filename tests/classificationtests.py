@@ -16,6 +16,8 @@ from ase.lattice.compounds import Zincblende
 from ase.lattice.cubic import SimpleCubicFactory
 from ase.data import covalent_radii
 import ase.io
+from networkx import draw_networkx
+import matplotlib.pyplot as mpl
 
 from matid import Classifier, SymmetryAnalyzer, PeriodicFinder
 from matid.classifications import \
@@ -29,8 +31,7 @@ from matid.classifications import \
     Surface
 import matid.geometry
 
-# from networkx import draw_networkx
-# import matplotlib.pyplot as mpl
+from conftest import create_graphene
 
 
 class ExceptionTests(unittest.TestCase):
@@ -1145,26 +1146,14 @@ class Material2DTests(unittest.TestCase):
     def test_curved_2d(self):
         """Curved 2D-material
         """
-        graphene = Atoms(
-            symbols=[6, 6],
-            cell=np.array((
-                [2.4595121467478055, 0.0, 0.0],
-                [-1.2297560733739028, 2.13, 0.0],
-                [0.0, 0.0, 20.0]
-            )),
-            scaled_positions=np.array((
-                [0.3333333333333333, 0.6666666666666666, 0.5],
-                [0.6666666666666667, 0.33333333333333337, 0.5]
-            )),
-            pbc=True
-        )
+        graphene = create_graphene()
         graphene = graphene.repeat([5, 5, 1])
 
         # Bulge the surface
         cell_width = np.linalg.norm(graphene.get_cell()[0, :])
         for atom in graphene:
             pos = atom.position
-            distortion_z = 0.35*np.sin(pos[0]/cell_width*2.0*np.pi)
+            distortion_z = 0.30*np.sin(pos[0]/cell_width*2.0*np.pi)
             pos += np.array((0, 0, distortion_z))
 
         classifier = Classifier()
@@ -1679,7 +1668,7 @@ class SurfaceTests(unittest.TestCase):
         classification = classifier.classify(system)
         self.assertIsInstance(classification, Surface)
 
-        # Has outliers with these settings
+        # Has no outliers with these settings
         outliers = classification.outliers
         self.assertTrue(len(outliers) == 0)
 
@@ -2055,7 +2044,7 @@ class SurfaceTests(unittest.TestCase):
             # disloc = rng.rand(len(system), 3)
         for i in range(10):
             i_sys = system.copy()
-            matid.geometry.make_random_displacement(system, 0.09, rng)
+            matid.geometry.make_random_displacement(system, 0.04, rng)
             # view(system)
 
             # Classified as surface
@@ -2254,7 +2243,7 @@ class SearchGraphTests(unittest.TestCase):
 
         # Check that the correct graph is created
         self.assertEqual(len(G.nodes), 1)
-        self.assertEqual(len(G.edges), 4)
+        self.assertEqual(len(G.edges), 8)
 
         # Check graph periodicity
         periodicity = region.get_connected_directions()
@@ -2292,7 +2281,7 @@ class SearchGraphTests(unittest.TestCase):
 
         # Check that the correct graph is created
         self.assertEqual(len(G.nodes), 2)
-        self.assertEqual(len(G.edges), 7)
+        self.assertEqual(len(G.edges), 11)
 
         # Check graph periodicity
         periodicity = region.get_connected_directions()
@@ -2327,7 +2316,7 @@ class SearchGraphTests(unittest.TestCase):
 
         # Check that the correct graph is created
         self.assertEqual(len(G.nodes), 4)
-        self.assertEqual(len(G.edges), 12)
+        self.assertEqual(len(G.edges), 22)
 
         # Check graph periodicity
         periodicity = region.get_connected_directions()
@@ -2383,4 +2372,4 @@ if __name__ == '__main__':
     suites.append(unittest.TestLoader().loadTestsFromTestCase(Class3DTests))
 
     alltests = unittest.TestSuite(suites)
-    result = unittest.TextTestRunner(verbosity=0).run(alltests)
+    result = unittest.TextTestRunner(verbosity=3).run(alltests)

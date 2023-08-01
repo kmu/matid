@@ -104,37 +104,6 @@ class LinkedUnitCollection(dict):
 
         return recreated_system
 
-    def create_animation(self, ):
-        """Used to create an animation of the search procedure. The unit cells are .
-        """
-        recreated_system = Atoms(
-            cell=self.system.get_cell(),
-            pbc=self.system.get_pbc(),
-        )
-        for iunit, unit in enumerate(self.values()):
-            i_valid_indices = np.array([x for x in unit.basis_indices if x is not None])
-            if len(i_valid_indices) != 0:
-                i_atoms = self.system[i_valid_indices]
-                recreated_system += i_atoms
-                write('/home/lauri/Desktop/crystal/image_{}.png'.format(iunit), recreated_system, rotation='90x,20y,20x', show_unit_cell=2)
-
-        # return recreated_system
-        # for unit_cell in self.values():
-            # rec = self.recreate_valid()
-            # rec.set_cell(self.system.get_cell())
-            # num = len(collection)
-            # str_num = str(num)
-            # str_len = len(str_num)
-            # num = (3-str_len)*"0" + str_num
-            # # write('/home/lauri/Desktop/2d/image_{}.png'.format(num), rec, rotation='-90x,45y,45x', show_unit_cell=2)
-            # # write('/home/lauri/Desktop/2d/image_{}.png'.format(num), rec, rotation='', show_unit_cell=2)
-            # # write('/home/lauri/Desktop/curved/image_{}.png'.format(num), rec, rotation='-80x', show_unit_cell=2)
-            # # try:
-            # write('/home/lauri/Desktop/crystal/image_{}.png'.format(num), rec, rotation='90x,20y,20x', show_unit_cell=2)
-            # except Exception:
-                # pass
-            # else:
-                # raise Exception("")
 
     def get_basis_atom_neighbourhood(self):
         """For each atom in the basis calculates the chemical neighbourhood.
@@ -210,29 +179,38 @@ class LinkedUnitCollection(dict):
             to this collection of LinkedUnits.
         """
         if self._basis_indices is None:
-            translations, translations_reduced = self.get_chem_env_translations()
-
-            # For each atom in the basis check the chemical environment
-            neighbour_map = self.get_basis_atom_neighbourhood()
-
-            indices = set()
-            for unit in self.values():
-
-                # Compare the chemical environment near this atom to the one
-                # that is present in the prototype cell. If these
-                # neighbourhoods are too different, then the atom is not
-                # counted as being a part of the region.
-                for i_index, index in enumerate(unit.basis_indices):
-                    if index is not None:
-                        real_environment = self.get_chemical_environment(self.system, index, self.disp_tensor_finite, translations, translations_reduced)
-                        ideal_environment = neighbour_map[i_index]
-                        chem_similarity = self.get_chemical_similarity(ideal_environment, real_environment)
-                        if chem_similarity >= self.chem_similarity_threshold:
+            # The chemical similarity check is completely skipped if threshold is zero
+            if self.chem_similarity_threshold == 0:
+                indices = set()
+                for unit in self.values():
+                    for index in unit.basis_indices:
+                        if index is not None:
                             indices.add(index)
+                self._basis_indices = indices
+            else:
+                translations, translations_reduced = self.get_chem_env_translations()
 
-            # Ensure that all the basis atoms belong to the same cluster.
-            # clusters = self.get_clusters()
-            self._basis_indices = np.array(list(indices))
+                # For each atom in the basis check the chemical environment
+                neighbour_map = self.get_basis_atom_neighbourhood()
+
+                indices = set()
+                for unit in self.values():
+
+                    # Compare the chemical environment near this atom to the one
+                    # that is present in the prototype cell. If these
+                    # neighbourhoods are too different, then the atom is not
+                    # counted as being a part of the region.
+                    for i_index, index in enumerate(unit.basis_indices):
+                        if index is not None:
+                            real_environment = self.get_chemical_environment(self.system, index, self.disp_tensor_finite, translations, translations_reduced)
+                            ideal_environment = neighbour_map[i_index]
+                            chem_similarity = self.get_chemical_similarity(ideal_environment, real_environment)
+                            if chem_similarity >= self.chem_similarity_threshold:
+                                indices.add(index)
+
+                # Ensure that all the basis atoms belong to the same cluster.
+                # clusters = self.get_clusters()
+                self._basis_indices = np.array(list(indices))
 
         return self._basis_indices
 
@@ -528,111 +506,32 @@ class LinkedUnitCollection(dict):
 
     def get_connected_directions(self):
         """During the tracking of the region the information about searches
-        that matched an atom twive but with a negated multiplier are stored.
+        that matched an atom twice but with a negated multiplier are stored.
         """
-        connected_directions = np.array([False, False, False])
-
-        # Find all the nodes that have at least two incoming edges. If there
-        # are two incoming edges with negated multiplier, there is periodicity
-        # in the multiplier direction.
         G = self._search_graph
+        dir_vectors = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        directions = set([0, 1, 2])
         for node in G.nodes():
             node_edges = G.in_edges(node, data=True)
-            multiplier_sum = np.array([0, 0, 0])
-            multiplier_presence = np.array([False, False, False])
-            for edge in node_edges:
-                source = edge[0]
-                dest = edge[1]
-                unit_index_change = np.array(dest) - np.array(source)
-                multiplier = edge[2]["multiplier"]
-                multiplier_sum += multiplier
+            dir_to_remove = set()
+            for direction in directions:
+                positive = False
+                negative = False
+                for edge in node_edges:
+                    multiplier = edge[2]["multiplier"]
+                    if np.array_equal(multiplier, dir_vectors[direction]):
+                        positive = True
+                    if np.array_equal(multiplier, -dir_vectors[direction]):
+                        negative = True
+                    if positive and negative:
+                        break
+                if positive and negative:
+                    dir_to_remove.add(direction)
+            directions -= dir_to_remove
 
-                # Create a mask that selects the index where the move occurred
-                move_mask = multiplier != 0
-
-                # If the movement does not correspond to the change in unit
-                # cell index, then the movement has wrapped across and that
-                # direction is periodic
-                if multiplier[move_mask] != unit_index_change[move_mask]:
-                    multiplier_presence[move_mask] = True
-
-            for i in range(3):
-                if multiplier_presence[i]:
-                    if multiplier_sum[i] == 0:
-                        connected_directions[i] = True
-
-        # For each loop, we calculate the total displacement. If it is nonzero,
-        # the nonzero direction is marked as a connected direction.
-        # cycles = list(nx.simple_cycles(self._search_graph))
-        # loop_multipliers = []
-        # for i_loop, loop in enumerate(cycles):
-            # loop_len = len(loop)
-
-            # # A self-loop can be formed when the found vector corresponds to a
-            # # simulation vector. In this case the loop has only one element,
-            # # and all the edges are valid multipliers.
-            # if loop_len == 1:
-                # source = loop[0]
-                # dest = loop[0]
-                # edges = G[source][dest]
-                # for key, edge in edges.items():
-                    # multiplier = edge["multiplier"]
-                    # loop_multipliers.append(multiplier)
-            # # A loop between two atoms can be formed when there are only two
-            # # repetitions of the cell per simulation cell basis vector. In any
-            # # of the preset multipliers will be valid. Two-element loops within
-            # # the simulation cell cannot be formed because the search never
-            # # come back to an atom without crossing the periodic boundary.
-            # elif loop_len == 2:
-                # source = loop[0]
-                # dest = loop[1]
-                # edges = G[source][dest]
-                # for key, edge in edges.items():
-                    # multiplier = edge["multiplier"]
-                    # if multiplier[0] != 0:
-                        # print(multiplier)
-                        # print(G.nodes[source])
-                        # print(G.nodes[dest])
-                    # loop_multipliers.append(multiplier)
-            # # We can ignore loops with more elements. The two-body loops will
-            # # already tell the directions in which the graph is periodic.
-            # else:
-                # pass
-
-        # loop_multipliers = np.array(loop_multipliers)
-        # indices = np.where(loop_multipliers != 0)[1]
-        # indices = np.unique(indices)
-        # connected_directions[indices] = True
-
+        connected_directions = np.array([True, True, True])
+        connected_directions[list(directions)] = False
         return connected_directions
-
-    # def get_cell_statistically_valid(self):
-        # """Checks that in this region a certain fraction of the cells is
-        # complete, i.e. has all the atoms that were found for the prototype
-        # cell.
-        # """
-        # n_all = 0
-        # index_occurrence_map = defaultdict(lambda: 0)
-        # for cell in self.values():
-            # none_found = False
-            # index_found = False
-            # for i, basis_index in enumerate(cell.basis_indices):
-                # if basis_index is not None:
-                    # index_occurrence_map[i] += 1
-                    # index_found = True
-                # else:
-                    # none_found = True
-            # if none_found:
-                # if index_found:
-                    # n_all += 1
-
-        # for index, value in index_occurrence_map.items():
-            # if value/n_all <= 0.5:
-                # return False
-        # return True
-
-        # full_fraction = n_full / n_all
-        # return full_fraction > 0.5
 
 
 class LinkedUnit():

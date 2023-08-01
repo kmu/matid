@@ -1,22 +1,25 @@
 import itertools
-
 from collections import deque, defaultdict, OrderedDict
 
 import numpy as np
 from numpy.core.umath_tests import inner1d
-
 import networkx as nx
-
-from sklearn.cluster import DBSCAN
-
 from ase import Atoms
-from ase.visualize import view
-from ase.data import covalent_radii
 
 import matid.geometry
 from matid.data import constants
 from matid.core.linkedunits import LinkedUnitCollection, LinkedUnit
-from matid.exceptions import SystaxError
+from matid.core.distances import Distances
+from matid.exceptions import MatIDError
+
+# These are the directions in which the recursive search can progress into. Note
+# that also diagonal directions should be included in order for the search to
+# not miss atoms.
+multipliers_3d = np.array(list(itertools.product([0, 1, -1], [0, 1, -1], [0, 1, -1], repeat=1)))
+multipliers_3d = multipliers_3d[1:]
+multipliers_2d = np.zeros((8, 3), dtype=int)
+multipliers_2d_directions = np.array(list(itertools.product([0, 1, -1], [0, 1, -1], repeat=1)))
+multipliers_2d[:, 0:2] = multipliers_2d_directions[1:]
 
 
 class PeriodicFinder():
@@ -49,16 +52,15 @@ class PeriodicFinder():
 
     def get_region(
             self,
-            system,
+            system: Atoms,
             seed_index,
             max_cell_size,
             pos_tol,
             delaunay_threshold=None,
             bond_threshold=None,
-            disp_tensor_mic=None,
-            disp_factors=None,
-            disp_tensor_finite=None,
-            dist_matrix_radii_mic=None,
+            overlap_threshold=-0.1,
+            distances: Distances = None,
+            return_mask: bool = False
         ):
         """Tries to find the periodic regions, like surfaces, in an atomic
         system.
@@ -71,6 +73,13 @@ class PeriodicFinder():
             max_cell_size(float): The maximum size of cell basis vectors.
             pos_tol(float): The tolerance that is allowed in the search. Given
                 as absolute value in angstroms.
+            bond_threshold(float): Used to control the connectivity threshold
+              for accepting unit cells. Small values allow only regions with
+              cells where atoms are tightly connected, large values will also
+              allows "sparser" cells.
+            overlap_threshold(float): Used to exclude non-physical cells by
+                checking overlap of atoms. Overlap between two atoms is calculated
+                by subtracting atomic radii from the distance between the atoms.
 
         Returns:
             linkedunitcollection or None: A LinkedUnitCollection object representing
@@ -82,80 +91,57 @@ class PeriodicFinder():
             bond_threshold = constants.BOND_THRESHOLD
 
         # If the distance information is not given, calculate it here.
-        pbc = system.get_pbc()
-        if disp_tensor_mic is None and disp_factors is None and disp_tensor_finite is None and dist_matrix_radii_mic is None:
-            pos = system.get_positions()
-            cell = system.get_cell()
-            pbc = system.get_pbc()
-            disp_tensor_finite = matid.geometry.get_displacement_tensor(pos, pos)
-            if pbc.any():
-                disp_tensor_mic, disp_factors = matid.geometry.get_displacement_tensor(
-                    pos,
-                    pos,
-                    cell,
-                    pbc,
-                    mic=True,
-                    return_factors=True
-                )
-            else:
-                disp_tensor_mic = disp_tensor_finite
-                disp_factors = np.zeros(disp_tensor_finite.shape)
-            dist_matrix_mic = np.linalg.norm(disp_tensor_mic, axis=2)
+        if distances is None:
+            distances = matid.geometry.get_distances(system)
 
-            # Calculate the distance matrix where the periodicity and the covalent
-            # radii have been taken into account
-            dist_matrix_radii_mic = np.array(dist_matrix_mic)
-            num = system.get_atomic_numbers()
-            radii = covalent_radii[num]
-            radii_matrix = radii[:, None] + radii[None, :]
-            dist_matrix_radii_mic -= radii_matrix
-
-        self.disp_tensor_mic = disp_tensor_mic
-        self.disp_tensor_finite = disp_tensor_finite
-        self.disp_factors = disp_factors
-        self.dist_matrix_radii_mic = dist_matrix_radii_mic
+        self.disp_tensor_mic = distances.disp_tensor_mic
+        self.disp_tensor_finite = distances.disp_tensor_finite
+        self.disp_factors = distances.disp_factors
+        self.dist_matrix_radii_mic = distances.dist_matrix_radii_mic
         self.pos_tol = pos_tol
         self.max_cell_size = max_cell_size
         region = None
 
-        possible_spans, neighbour_mask, neighbour_factors = self._find_possible_bases(system, seed_index)
+        possible_spans, neighbour_mask, neighbour_factors, search_mask = self._find_possible_bases(system, seed_index)
         proto_cell, offset, dim = self._find_proto_cell(
             system,
             seed_index,
             possible_spans,
             neighbour_mask,
             neighbour_factors,
-            bond_threshold
+            bond_threshold,
+            overlap_threshold,
+            pos_tol
         )
+
 
         # 1D is not handled
-        if dim == 1 or proto_cell is None:
-            return None
+        region = None
+        if dim != 1 and proto_cell is not None:
+            # The indices of the periodic dimensions.
+            periodic_indices = list(range(dim))
 
-        # The indices of the periodic dimensions.
-        periodic_indices = list(range(dim))
+            # Find a region that is spanned by the found unit cell
+            unit_collection = self._find_periodic_region(
+                system,
+                dim == 2,
+                delaunay_threshold,
+                bond_threshold,
+                seed_index,
+                proto_cell,
+                offset,
+                periodic_indices,
+            )
 
-        # view(proto_cell)
-        # print(proto_cell.get_cell())
+            i_indices = unit_collection.get_basis_indices()
 
-        # Find a region that is spanned by the found unit cell
+            if len(i_indices) > 0:
+                region = unit_collection
+                region._pos_tol = pos_tol
 
-        unit_collection = self._find_periodic_region(
-            system,
-            dim == 2,
-            delaunay_threshold,
-            bond_threshold,
-            seed_index,
-            proto_cell,
-            offset,
-            periodic_indices,
-        )
-
-        i_indices = unit_collection.get_basis_indices()
-        if len(i_indices) > 0:
-            region = unit_collection
-            region._pos_tol = pos_tol
-            return region
+        if return_mask:
+            return region, search_mask
+        return region
 
     def _find_possible_bases(self, system, seed_index):
         """Finds all the possible vectors that might span a cell.
@@ -184,12 +170,13 @@ class PeriodicFinder():
         distance_mask = (seed_span_lengths < self.max_cell_size)
 
         # Form a combined mask and filter spans with it
-        combined_mask = (distance_mask) & (identical_elem_mask)
+        search_mask = (distance_mask) & (identical_elem_mask)
+        combined_mask = np.array(search_mask)
         combined_mask[seed_index] = False  # Ignore self
         bases = seed_spans[combined_mask]
         neighbour_factors = self.disp_factors[seed_index, distance_mask, :]
 
-        return bases, distance_mask, neighbour_factors
+        return bases, distance_mask, neighbour_factors, search_mask
 
     def _find_proto_cell(
             self,
@@ -198,7 +185,9 @@ class PeriodicFinder():
             possible_spans,
             neighbour_mask,
             neighbour_factors,
-            bond_threshold
+            bond_threshold,
+            overlap_threshold,
+            pos_tol
         ):
         """Used to find the best candidate for a unit cell basis that could
         generate a periodic region in the structure.
@@ -333,6 +322,168 @@ class PeriodicFinder():
             best_adjacency_lists_add.append(i_adjacency_list_add)
             best_adjacency_lists_sub.append(i_adjacency_list_sub)
 
+        # Get graphs for each atom in the prototype cell
+        seed_nodes, seed_group_index, group_data_pbc = self._find_graphs(
+            seed_index,
+            numbers,
+            dim,
+            best_adjacency_lists,
+            neighbour_nodes,
+            neighbour_indices,
+            neighbour_factors
+        )
+
+        # If the seed atom is not in a valid graph, no region could be found.
+        if seed_group_index is None:
+            return None, None, None
+
+        # Notice that the seed group index can get updated by the cell search if
+        # an atom is dropped out of the cell due to appearing too infrequently.
+        if n_spans == 3:
+            proto_cell, offset, seed_group_index = self._find_proto_cell_3d(
+                seed_nodes,
+                best_spans,
+                system,
+                group_data_pbc,
+                seed_group_index,
+                best_adjacency_lists_add,
+                best_adjacency_lists_sub,
+                pos_tol
+            )
+        elif n_spans == 2:
+            proto_cell, offset, seed_group_index = self._find_proto_cell_2d(
+                seed_nodes,
+                best_spans,
+                system,
+                group_data_pbc,
+                seed_group_index,
+                best_adjacency_lists_add,
+                best_adjacency_lists_sub,
+                pos_tol
+            )
+        if proto_cell is None:
+            return None, None, None
+
+        two_valid_spans = n_spans == 2
+        if n_spans == 3:
+            # It is possible that a structure with several identical 2D layers
+            # will get detected as a bulk cell. It is tricky to distinguish
+            # between these two cases (e.g. graphite vs. two layers of graphene).
+            # Here dimensionality is used to separate these two cases: if
+            # dimensionality == 3 the 3D cell is accepted, otherwise we try to
+            # extract 2D layers.
+            try:
+                dimensionality = matid.geometry.get_dimensionality(proto_cell, bond_threshold)
+            except MatIDError:
+                return None, None, None
+            if dimensionality != 3:
+                # Try if the cell can be "reduced" to a 2D material
+                if dimensionality == 2:
+                    # Figure out the thinnest basis: it will become the
+                    # non-periodic orthogonal basis TODO: This may not work for
+                    # 2D materials with non-zero thickness.
+                    thicknesses = [matid.geometry.get_thickness(proto_cell, x) for x in range(3)]
+                    reduced_dimension = np.argmin(thicknesses)
+
+                    # Construct new basis out of the two thickest directions +
+                    # new orthogonal basis
+                    new_basis = []
+                    old_basis = proto_cell.get_cell()
+                    for i in range(3):
+                        if i != reduced_dimension:
+                            new_basis.append(old_basis[i, :])
+                    new_basis.append(matid.geometry.complete_cell(new_basis[0], new_basis[1], 1)[0])
+                    proto_cell.set_cell(np.array(new_basis))
+                    proto_cell.set_pbc([True, True, False])
+                    proto_cell = matid.geometry.get_minimized_cell(proto_cell, 2, 2*self.pos_tol)
+                    cell_mask = [True, True, True]
+                    cell_mask[reduced_dimension] = False
+                    best_combo = best_combo[cell_mask]
+                    best_spans = best_spans[cell_mask]
+                    two_valid_spans = True
+                    n_spans = 2
+                else:
+                    return None, None, None
+
+        if two_valid_spans:
+            # If the best 2D vectors consists only of the simulation basis cell
+            # vectors, check that these vectors are below a predefined size.
+            # Otherwise the cell cannot be accepted because there is not enough
+            # statistics about the cell contents to distinguish outliers.
+            if n_periodic_spans > 0:
+                periodic_span_indices = valid_span_indices[-n_periodic_spans:]
+                best_span_ind = valid_span_indices[best_combo]
+                if set(best_span_ind).issubset(set(periodic_span_indices)):
+                    cell_lens = np.linalg.norm(best_spans, axis=1)
+                    if np.any(cell_lens > self.max_2d_single_cell_size):
+                        return None, None, None
+
+            # Check the dimensionality
+            dimensionality, cluster_labels = matid.geometry.get_dimensionality(proto_cell, bond_threshold, return_clusters=True)
+            if dimensionality is None:
+                # If the original system has more than one cluster, the system
+                # has multiple stacked 2D sheets with identical periodicity. In
+                # this case the unit cell should only comprise of atoms in the
+                # cluster where the seed atom is in.
+                for i_index, i_cluster in enumerate(cluster_labels):
+                    try:
+                        seed_group_index = i_cluster.index(seed_group_index)
+                    except ValueError:
+                        pass
+                    else:
+                        cluster_indices = i_cluster
+                        break
+                proto_cell = proto_cell[cluster_indices]
+
+                # Retry to get the dimensionality for the cell in which the
+                # cluster where the seed atom is in has been separated.
+                dimensionality = matid.geometry.get_dimensionality(proto_cell, bond_threshold)
+                if dimensionality is None:
+                    return None, None, None
+                else:
+                    if dimensionality != 2:
+                        return None, None, None
+            else:
+                if dimensionality != 2:
+                    return None, None, None
+
+            # Check the cell thickness. 2D materials that are thicker than a
+            # specified threshold are not accepted.
+            proto_cell = matid.geometry.get_minimized_cell(proto_cell, 2, 2*self.pos_tol)
+            offset = proto_cell.get_positions()[seed_group_index]
+            thickness = matid.geometry.get_thickness(proto_cell, 2)
+            if thickness > self.max_2d_cell_height:
+                return None, None, None
+
+        # Check that the final proto cell atoms don't overlap
+        if proto_cell is not None:
+            dist_proto_cell = matid.geometry.get_distances(proto_cell).dist_matrix_mic
+            dist_proto_cell = dist_proto_cell[np.triu_indices(dist_proto_cell.shape[0])]
+            if dist_proto_cell.min() < overlap_threshold:
+                return None, None, None
+
+        return proto_cell, offset, n_spans
+
+    def _find_graphs(self, seed_index, numbers, dim, best_adjacency_lists, neighbour_nodes, neighbour_indices, neighbour_factors):
+        """
+        Creates graphs for each atom that is contained in the prototype cell.
+        These graphs represent the connectivity of the atom to other aotm in the
+        neighbourhood using the best basis spans.
+
+        Args:
+            seed_index(int): Index of the seed atom
+            numbers(): Atomic numbers
+            dim(int): Dimensionality of the system
+            best_adjacency_lists
+            neighbour_nodes
+            neighbour_indices
+            neighbour_factors
+
+        Returns:
+            seed_nodes
+            seed_group_index(int): Index of the graph corresponding to the seed atom.
+            group_data_pbc
+        """
         # Create a full periodicity graph for the found basis
         periodicity_graph_pbc = None
         full_adjacency_list_pbc = defaultdict(list)
@@ -371,16 +522,6 @@ class PeriodicFinder():
                     if not new_graph.has_edge(node, new_node):
                         new_graph.add_edge(node, new_node)
         periodicity_graph_pbc = new_graph
-
-        # import matplotlib.pyplot as plt
-        # plt.subplot(111)
-        # pos = nx.spring_layout(periodicity_graph_pbc)
-        # nx.draw_networkx_nodes(periodicity_graph_pbc, pos)
-        # nx.draw_networkx_edges(periodicity_graph_pbc, pos)
-        # data = periodicity_graph_pbc.nodes(data=True)
-        # labels = {x[0]: x[0] for x in data}
-        # nx.draw_networkx_labels(periodicity_graph_pbc, pos, labels, font_size=16)
-        # plt.show()
 
         # Get all disconnected subgraphs in the periodicity graph that takes
         # periodic boundaries into account
@@ -433,9 +574,7 @@ class PeriodicFinder():
         if len(valid_graphs) == 0:
             return None, None, None
 
-        # Each subgraph represents a group of atoms that repeat periodically in
-        # each cell. Here we calculate a mean position of these atoms in the
-        # cell.
+        # Determine the indices, nodes and numbers for each valid subgraph.
         seed_nodes = None
         seed_group_index = None
         group_data_pbc = {
@@ -443,151 +582,36 @@ class PeriodicFinder():
             "ind": [],
             "nodes": []
         }
-        # Determine the indices, nodes and numbers for each valid subgraph.
-        # index_set = set()
         for i_graph, graph in enumerate(valid_graphs):
             nodes = graph.nodes()
             node_indices = [node[0] for node in nodes]
 
-            if seed_index in set(node_indices):
-                seed_group_index = i_graph
-                seed_nodes = nodes
+            # The seed atom index may appear in multiple graphs due to periodic
+            # wrapping. In order to see which graph originated from the seed
+            # atom we have to find the graph which has the seed atom under cell
+            # (0, 0, 0).
+            for atom_index, cell_index in nodes:
+                if atom_index == seed_index and cell_index == (0, 0, 0):
+                    seed_group_index = i_graph
+                    seed_nodes = nodes
+                    break
 
             group_data_pbc["ind"].append(node_indices)
             group_data_pbc["nodes"].append(nodes)
             group_data_pbc["num"].append(numbers[node_indices][0])
 
-        # If the seed atom is not in a valid graph, no region could be found.
-        if seed_group_index is None:
-            return None, None, None
-
-        if n_spans == 3:
-            proto_cell, offset = self._find_proto_cell_3d(
-                seed_index,
-                seed_nodes,
-                best_combo,
-                best_spans,
-                system,
-                group_data_pbc,
-                seed_group_index,
-                best_adjacency_lists_add,
-                best_adjacency_lists_sub,
-            )
-        elif n_spans == 2:
-
-            # The seed group index can get updated by the cell search
-            proto_cell, offset, seed_group_index = self._find_proto_cell_2d(
-                seed_index,
-                seed_nodes,
-                best_combo,
-                best_spans,
-                system,
-                group_data_pbc,
-                seed_group_index,
-                best_adjacency_lists_add,
-                best_adjacency_lists_sub,
-            )
-
-            if proto_cell is None:
-                return None, None, None
-
-        two_valid_spans = n_spans == 2
-        if n_spans == 3:
-            # If the max_cell_size is bigger than an interlayer distance
-            # between two 2D sheets, then a wrong cell with a lot of vacuum
-            # might get detected. Here we check that the dimensionality of the
-            # found 3D cell is correct.
-            try:
-                dimensionality = matid.geometry.get_dimensionality(proto_cell, bond_threshold)
-            except SystaxError:
-                return None, None, None
-            if dimensionality != 3:
-                # If the cell has three unit vectors, but does not exhibit the
-                # correct dimensionality, try if two of the cell vectors are
-                # still OK.
-                if dimensionality == 2:
-                    a_thickness = matid.geometry.get_thickness(proto_cell, 0)
-                    b_thickness = matid.geometry.get_thickness(proto_cell, 1)
-                    c_thickness = matid.geometry.get_thickness(proto_cell, 2)
-                    reduced_dimension = np.argmin([a_thickness, b_thickness, c_thickness])
-                    proto_cell = matid.geometry.get_minimized_cell(proto_cell, reduced_dimension, 2*self.pos_tol)
-                    i_pbc = [True, True, True]
-                    i_pbc[reduced_dimension] = False
-                    cell_mask = [True, True, True]
-                    cell_mask[reduced_dimension] = False
-                    proto_cell.set_pbc(i_pbc)
-                    best_combo = best_combo[cell_mask]
-                    best_spans = best_spans[cell_mask]
-                    two_valid_spans = True
-                    n_spans = 2
-                else:
-                    return None, None, None
-
-        if two_valid_spans:
-
-            # If the best 2D vectors consists only of the simulation basis cell
-            # vectors, check that these vectors are below a predefined size.
-            # Otherwise the cell cannot be accepted because there is not enough
-            # statistics about the cell contents to distinguish outliers.
-            if n_periodic_spans > 0:
-                periodic_span_indices = valid_span_indices[-n_periodic_spans:]
-                best_span_ind = valid_span_indices[best_combo]
-                if set(best_span_ind).issubset(set(periodic_span_indices)):
-                    cell_lens = np.linalg.norm(best_spans, axis=1)
-                    if np.any(cell_lens > self.max_2d_single_cell_size):
-                        return None, None, None
-
-            # Check the dimensionality
-            dimensionality, cluster_labels = matid.geometry.get_dimensionality(proto_cell, bond_threshold, return_clusters=True)
-            if dimensionality is None:
-                # If the original system has more than one cluster, the system
-                # has multiple stacked 2D sheets with identical periodicity. In
-                # this case the unit cell should only comprise of atoms in the
-                # cluster where the seed atom is in.
-                for i_index, i_cluster in enumerate(cluster_labels):
-                    try:
-                        seed_group_index = i_cluster.index(seed_group_index)
-                    except ValueError:
-                        pass
-                    else:
-                        cluster_indices = i_cluster
-                        break
-                proto_cell = proto_cell[cluster_indices]
-
-                # Retry to get the dimensionality for the cell in which the
-                # cluster where the seed atom is in has been separated.
-                # view(proto_cell)
-                dimensionality = matid.geometry.get_dimensionality(proto_cell, bond_threshold)
-                if dimensionality is None:
-                    return None, None, None
-                else:
-                    if dimensionality != 2:
-                        return None, None, None
-            else:
-                if dimensionality != 2:
-                    return None, None, None
-
-            # Check the cell thickness. 2D materials that are thicker than a
-            # specified threshold are accepted.
-            proto_cell = matid.geometry.get_minimized_cell(proto_cell, 2, 2*self.pos_tol)
-            offset = proto_cell.get_positions()[seed_group_index]
-            thickness = matid.geometry.get_thickness(proto_cell, 2)
-            if thickness > self.max_2d_cell_height:
-                return None, None, None
-
-        return proto_cell, offset, n_spans
+        return seed_nodes, seed_group_index, group_data_pbc
 
     def _find_proto_cell_3d(
             self,
-            seed_index,
             seed_nodes,
-            best_span_indices,
             best_spans,
             system,
             group_data_pbc,
             seed_group_index,
             adjacency_add,
             adjacency_sub,
+            pos_tol
         ):
         """Given a cell shape, this function is used to return a fully
         populated prototype unit cell for 3D systems.
@@ -605,6 +629,7 @@ class PeriodicFinder():
             seed_group_index():
             adjacency_add():
             adjacency_sub():
+            pos_tol(): Position tolerance
 
         Returns:
             unit_cell(ase.Atoms): The unit cell
@@ -626,10 +651,6 @@ class PeriodicFinder():
             node_index = node[0]
             node_factor = node[1]
 
-            # multiplier: The direction in which the cell basis is searched. +1 or -1.
-            # node_factor: The cell index of the starting node.
-            # i_factor: The factor of the matched atom.
-
             # Handle each basis
             for i_basis in range(3):
                 a_final_neighbour = None
@@ -650,11 +671,6 @@ class PeriodicFinder():
                         multiplier = -1
 
                 if a_final_neighbour is not None:
-                    # Old version
-                    # a_correction = np.dot((-np.array(node_factor) + np.array(i_factor)), orig_cell)
-                    # a = multiplier*self.disp_tensor_finite[a_final_neighbour, node_index, :] + a_correction
-
-                    # New version
                     a_correction = np.dot((-np.array(node_factor) + np.array(i_factor)), orig_cell)
                     a = self.disp_tensor_finite[a_final_neighbour, node_index, :] + a_correction
                     a *= multiplier
@@ -678,26 +694,19 @@ class PeriodicFinder():
             if i_seed in index_cell_map:
                 i_indices, i_pos, i_factors = index_cell_map[i_seed]
             else:
-                i_indices, i_pos, i_factors = matid.geometry.get_positions_within_basis(
-                    system,
-                    cell,
-                    seed_pos,
-                    1e-8,
-                    -1e-8,
-                )
-
-                # Here we ensure that the seed atom is included in the cell
-                # positions. The search might miss the seed atom which is
-                # exactly at the border of the cell
-                # if i_seed not in i_indices:
-                    # i_indices = np.append(i_indices, [i_seed], axis=0)
-                    # i_pos = np.append(i_pos, np.array([[0, 0, 0.5]]), axis=0)
-                    # i_factors = np.append(i_factors, [[0, 0, 0]], axis=0)
-
+                # If there is a problem in using the given cell to retrieve
+                # positions (e.g. cell is singular), we don't report a prototype
+                # cell
+                try:
+                    i_indices, i_pos, i_factors = matid.geometry.get_positions_within_basis(
+                        system,
+                        cell,
+                        seed_pos,
+                        pos_tol
+                    )
+                except Exception:
+                    return None, None, None
                 index_cell_map[i_seed] = (i_indices, i_pos, i_factors)
-
-            # if (i_seed == 6):
-            # print(i_indices)
 
             # Add the seed node factor
             final_factors = []
@@ -712,11 +721,11 @@ class PeriodicFinder():
 
         # For each node in a network, find the first relative position. Wrap
         # and average these positions to get a robust final estimate.
-        # averaged_rel_pos = np.zeros((len(group_data_pbc["ind"]), 3))
         averaged_rel_pos = []
         averaged_rel_num = []
         new_group_index = None
 
+        scaled_positions = []
         for i_group, nodes in enumerate(group_data_pbc["nodes"]):
             group_num = group_data_pbc["num"][i_group]
             scaled_pos = []
@@ -727,10 +736,19 @@ class PeriodicFinder():
                         pos = cell_positions[pos_index]
                         scaled_pos.append(pos)
                         break
+            scaled_positions.append(scaled_pos)
+        max_occurrence = max(len(x) for x in scaled_positions)
 
-            # The basis location corresponding to this group is only added is
-            # at least one occurrence is found in a cell.
-            if len(scaled_pos) != 0:
+        for i_group, nodes in enumerate(group_data_pbc["nodes"]):
+            group_num = group_data_pbc["num"][i_group]
+            scaled_pos = scaled_positions[i_group]
+
+            # The atoms corresponding to this group is only added if the number
+            # of repetitions does does not differ significantly from the
+            # maximum. Especially when the seed has been chosen near an
+            # interface (between two surface or surface and vacuum) this check
+            # becomes important.
+            if len(scaled_pos) >= 1/3*max_occurrence:
                 scaled_pos = np.array(scaled_pos)
 
                 # Find the copy with minimum distance from origin
@@ -753,6 +771,10 @@ class PeriodicFinder():
                 new_group_index = len(averaged_rel_num) - 1
         seed_group_index = new_group_index
 
+        # If no atoms are found in the proto cell, return without results
+        if not averaged_rel_pos or not averaged_rel_num:
+            return None, None, None
+
         averaged_rel_pos = np.array(averaged_rel_pos)
 
         proto_cell = Atoms(
@@ -763,19 +785,18 @@ class PeriodicFinder():
         )
         offset = proto_cell.get_positions()[seed_group_index]
 
-        return proto_cell, offset
+        return proto_cell, offset, seed_group_index
 
     def _find_proto_cell_2d(
             self,
-            seed_index,
             seed_nodes,
-            best_span_indices,
             best_spans,
             system,
             group_data_pbc,
             seed_group_index,
             adjacency_add,
             adjacency_sub,
+            pos_tol
         ):
         """Given a cell shape, this function is used to return a fully
         populated prototype unit cell for 2D systems.
@@ -790,7 +811,7 @@ class PeriodicFinder():
                 array.
             system(ase.Atoms): Original system
             group_data_pbc():
-            seed_group_index():
+            seed_group_index(): Index of the group in which the seed atom is in.
             adjacency_add():
             adjacency_sub():
 
@@ -798,21 +819,15 @@ class PeriodicFinder():
             unit_cell(ase.Atoms): The unit cell
             offset(np.ndarray): The cartesian offset of the seed atom in the
                 cell.
+            seed_group_index(int): A new index of the seed atom in the cell.
         """
         orig_cell = system.get_cell()
 
-        # In 2D systems the maximum thickness of the system is defined by
+        # We need to make the third basis vector, In 2D systems the maximum thickness of the system is defined by
         # max_cell_size.
-        cutoff = self.max_cell_size
-
-        # We need to make the third basis vector
         a = best_spans[0]
         b = best_spans[1]
-        c = np.cross(a, b)
-        c_norm = c/np.linalg.norm(c)
-        c_norm = c_norm[None, :]
-        c_test = 2*c_norm*cutoff
-
+        c_test = matid.geometry.complete_cell(a, b, 2*self.max_cell_size)
         basis = np.concatenate((best_spans, c_test), axis=0)
 
         # Find the cells in which the copies of the seed atom are at the
@@ -855,11 +870,9 @@ class PeriodicFinder():
             # Update the third axis for each cell.
             a = cells[i_node, 0]
             b = cells[i_node, 1]
-            c = np.cross(a, b)
-            c_norm = c/np.linalg.norm(c)
+            c_norm = matid.geometry.complete_cell(a, b, 1)
             c_norms[i_node, :] = c_norm
-            c_norm = c_norm[None, :]
-            c = 2*c_norm*cutoff
+            c = 2 * self.max_cell_size * c_norm
             cells[i_node, 2, :] = c
 
         # Find the relative positions of atoms inside the cell
@@ -871,7 +884,7 @@ class PeriodicFinder():
         for i_unit, (i_node, cell) in enumerate(zip(seed_nodes, cells)):
             i_seed, i_seed_factor = i_node
             seed_pos = orig_pos[i_seed]
-            search_offset = -c_norms[i_unit, :]*cutoff
+            search_offset = -c_norms[i_unit, :] * self.max_cell_size
             search_coord = (seed_pos + search_offset)
 
             if i_seed in index_cell_map:
@@ -881,18 +894,8 @@ class PeriodicFinder():
                     system,
                     cell,
                     search_coord,
-                    1e-8,
-                    -1e-8,
+                    pos_tol
                 )
-
-                # Here we ensure that the seed atom is included in the cell
-                # positions. The search might miss the seed atom which is
-                # exactly at the border of the cell
-                # if i_seed not in i_indices:
-                    # i_indices = np.append(i_indices, [i_seed], axis=0)
-                    # i_pos = np.append(i_pos, np.array([[0, 0, 0.5]]), axis=0)
-                    # i_factors = np.append(i_factors, [[0, 0, 0]], axis=0)
-
                 index_cell_map[i_seed] = (i_indices, i_pos, i_factors)
 
             # Add the seed node factor
@@ -923,8 +926,8 @@ class PeriodicFinder():
                         scaled_pos.append(pos)
                         break
 
-            # The basis location corresponding to this group is only added is
-            # at least one occurrence is found in a cell.
+            # The basis location corresponding to this group is only added if at
+            # least one occurrence is found in a cell.
             if len(scaled_pos) != 0:
                 scaled_pos = np.array(scaled_pos)
 
@@ -952,6 +955,10 @@ class PeriodicFinder():
             if i_group == seed_group_index:
                 new_group_index = len(averaged_rel_num) - 1
         seed_group_index = new_group_index
+
+        # If no atoms are found in the proto cell, return without results
+        if not averaged_rel_pos or not averaged_rel_num:
+            return None, None, None
 
         # Move the seed positions back to the origin now that the search has
         # been performed
@@ -1061,13 +1068,6 @@ class PeriodicFinder():
             ortho = 3 - inner1d(n_ij_filtered, n_ij_filtered) - inner1d(n_ki_filtered, n_ki_filtered) - inner1d(n_jk_filtered, n_jk_filtered)
             max_ortho_filter = np.argmin(ortho)
             best_span_indices = valid_indices[max_ortho_filter]
-
-            # OLD VERSION
-            # angle_sum = alpha_ijk[angles_mask] + alpha_jki[angles_mask] + alpha_kij[angles_mask]
-            # angle_set = angle_sum[metric_filter][smallest_cell_filter]
-            # biggest_angle_sum_filter = np.argmax(angle_set)
-            # best_span_indices = valid_indices[biggest_angle_sum_filter]
-
         else:
             best_span_indices = self._find_best_2d_basis(norm_spans, norms, valid_span_metrics)
 
@@ -1250,22 +1250,23 @@ class PeriodicFinder():
         # Here we decide the new seed points where the search is extended.
         n_periodic_dim = len(periodic_indices)
         if n_periodic_dim == 3:
-            multipliers = np.array([
-                [1, 0, 0],
-                [0, 1, 0],
-                [0, 0, 1],
-                [-1, 0, 0],
-                [0, -1, 0],
-                [0, 0, -1],
-            ])
-
+            multipliers = multipliers_3d
+            # multipliers = np.array([
+            #     [1, 0, 0],
+            #     [0, 1, 0],
+            #     [0, 0, 1],
+            #     [-1, 0, 0],
+            #     [0, -1, 0],
+            #     [0, 0, -1],
+            # ])
         if n_periodic_dim == 2:
-            multipliers = np.array([
-                [1, 0, 0],
-                [0, 1, 0],
-                [-1, 0, 0],
-                [0, -1, 0],
-            ])
+            multipliers = multipliers_2d
+            # multipliers = np.array([
+            #     [1, 0, 0],
+            #     [0, 1, 0],
+            #     [-1, 0, 0],
+            #     [0, -1, 0],
+            # ])
 
         return multipliers
 
