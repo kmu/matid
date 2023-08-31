@@ -2,7 +2,6 @@ import itertools
 from collections import deque, defaultdict, OrderedDict
 
 import numpy as np
-from numpy.core.umath_tests import inner1d
 import networkx as nx
 from ase import Atoms
 
@@ -1015,17 +1014,17 @@ class PeriodicFinder():
         n_jk_norm = np.linalg.norm(n_jk, axis=1)
         with np.errstate(divide='ignore', invalid='ignore'):
             n_jk_hat = n_jk / n_jk_norm[:, None]
-        alpha_ijk = np.abs(inner1d(normed_combos[:, 0, :], n_jk_hat))
+        alpha_ijk = np.abs(np.einsum('ij,ij->i', normed_combos[:, 0, :], n_jk_hat))
         n_ki = np.cross(normed_combos[:, 2, :], normed_combos[:, 0, :])
         n_ki_norm = np.linalg.norm(n_ki, axis=1)
         with np.errstate(divide='ignore', invalid='ignore'):
             n_ki_hat = n_ki / n_ki_norm[:, None]
-        alpha_jki = np.abs(inner1d(normed_combos[:, 1, :], n_ki_hat))
+        alpha_jki = np.abs(np.einsum('ij,ij->i', normed_combos[:, 1, :], n_ki_hat))
         n_ij = np.cross(normed_combos[:, 0, :], normed_combos[:, 1, :])
         n_ij_norm = np.linalg.norm(n_ij, axis=1)
         with np.errstate(divide='ignore', invalid='ignore'):
             n_ij_hat = n_ij / n_ij_norm[:, None]
-        alpha_kij = np.abs(inner1d(normed_combos[:, 2, :], n_ij_hat))
+        alpha_kij = np.abs(np.einsum('ij,ij->i', normed_combos[:, 2, :], n_ij_hat))
 
         # The angles alpha, beta and gamma are cos(x), where x is the angle
         # between the vector and the normal of the plane. To get the angle y
@@ -1065,7 +1064,8 @@ class PeriodicFinder():
             n_ij_filtered = n_ij[angles_mask][metric_filter][smallest_cell_filter]
             n_ki_filtered = n_ki[angles_mask][metric_filter][smallest_cell_filter]
             n_jk_filtered = n_jk[angles_mask][metric_filter][smallest_cell_filter]
-            ortho = 3 - inner1d(n_ij_filtered, n_ij_filtered) - inner1d(n_ki_filtered, n_ki_filtered) - inner1d(n_jk_filtered, n_jk_filtered)
+            # ortho = 3 - inner1d(n_ij_filtered, n_ij_filtered) - inner1d(n_ki_filtered, n_ki_filtered) - inner1d(n_jk_filtered, n_jk_filtered)
+            ortho = 3 - np.einsum('ij,ij->i', n_ij_filtered, n_ij_filtered) - np.einsum('ij,ij->i', n_ki_filtered, n_ki_filtered) - np.einsum('ij,ij->i', n_jk_filtered, n_jk_filtered)
             max_ortho_filter = np.argmin(ortho)
             best_span_indices = valid_indices[max_ortho_filter]
         else:
