@@ -1064,7 +1064,8 @@ class PeriodicFinder():
             n_ij_filtered = n_ij[angles_mask][metric_filter][smallest_cell_filter]
             n_ki_filtered = n_ki[angles_mask][metric_filter][smallest_cell_filter]
             n_jk_filtered = n_jk[angles_mask][metric_filter][smallest_cell_filter]
-            ortho = 3 - inner1d(n_ij_filtered, n_ij_filtered) - inner1d(n_ki_filtered, n_ki_filtered) - inner1d(n_jk_filtered, n_jk_filtered)
+            # ortho = 3 - inner1d(n_ij_filtered, n_ij_filtered) - inner1d(n_ki_filtered, n_ki_filtered) - inner1d(n_jk_filtered, n_jk_filtered)
+            ortho = 3 - np.einsum('ij,ij->i', n_ij_filtered, n_ij_filtered) - np.einsum('ij,ij->i', n_ki_filtered, n_ki_filtered) - np.einsum('ij,ij->i', n_jk_filtered, n_jk_filtered)
             max_ortho_filter = np.argmin(ortho)
             best_span_indices = valid_indices[max_ortho_filter]
         else:
